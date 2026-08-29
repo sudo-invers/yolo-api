@@ -1,11 +1,10 @@
 import base64
-import os
 import json
+import os
 import time
 from pathlib import Path
 
 import httpx
-
 
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 IMAGES_DIR = Path("/client/images")

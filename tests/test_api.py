@@ -4,11 +4,10 @@ import base64
 import io
 
 import numpy as np
-from PIL import Image
 from fastapi.testclient import TestClient
+from PIL import Image
 
-from app.main import app, _decode_image
-
+from app.main import _decode_image, app
 
 client = TestClient(app)
 

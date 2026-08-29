@@ -1,26 +1,28 @@
+import asyncio
 import base64
 import io
+import logging
 import subprocess
 import time
-import asyncio
 
 import cv2
 import httpx
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
+from model import get_default_model_name, load_model
 from PIL import Image
-
-from model import load_model, get_default_model_name
 from schemas import (
-    PredictRequest,
-    PredictResponse,
     BatchPredictRequest,
     BatchPredictResponse,
+    Detection,
     HealthResponse,
     MetricsResponse,
-    Detection,
+    PredictRequest,
+    PredictResponse,
 )
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="YOLO Inference API",
@@ -90,9 +92,9 @@ def _capture_frame_from_camera(device_id: int = 0) -> np.ndarray:
 
             result = subprocess.run(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 timeout=5,
+                check=False,
             )
 
             if result.returncode == 0 and len(result.stdout) > 0:
@@ -102,8 +104,10 @@ def _capture_frame_from_camera(device_id: int = 0) -> np.ndarray:
 
                 return np.array(img)
 
-        except Exception:
-            pass
+        except (OSError, subprocess.SubprocessError) as e:
+            logger.warning(
+                "Falha ao capturar via %s: %s", cmd_tool, e
+            )
 
     # 2. Fallback para câmeras USB padrão (V4L2)
     cap = cv2.VideoCapture(device_id)
@@ -188,7 +192,8 @@ async def health_check():
     try:
         load_model(model_name)
         loaded = True
-    except Exception:
+    except (OSError, RuntimeError, ValueError) as e:
+        logger.warning("Falha ao carregar modelo %s: %s", model_name, e)
         loaded = False
 
     return HealthResponse(
@@ -223,13 +228,14 @@ def predict(request: PredictRequest):
         raise HTTPException(
             status_code=404,
             detail=str(e),
-        )
+        ) from e
 
     except Exception as e:
+        logger.exception("Erro inesperado em /predict")
         raise HTTPException(
             status_code=500,
             detail=str(e),
-        )
+        ) from e
 
 
 @app.post(
@@ -295,13 +301,14 @@ def predict_image(request: PredictRequest):
         raise HTTPException(
             status_code=404,
             detail=str(e),
-        )
+        ) from e
 
     except Exception as e:
+        logger.exception("Erro inesperado em /predict/image")
         raise HTTPException(
             status_code=500,
             detail=str(e),
-        )
+        ) from e
 
 
 # ── Novos Endpoints: Integração com a Câmera ────────────────
@@ -353,10 +360,11 @@ def predict_from_camera(
         raise
 
     except Exception as e:
+        logger.exception("Erro inesperado em /predict/camera")
         raise HTTPException(
             status_code=500,
             detail=str(e),
-        )
+        ) from e
 
 
 @app.get(
@@ -438,10 +446,11 @@ def predict_from_camera_image(
         raise
 
     except Exception as e:
+        logger.exception("Erro inesperado em /predict/camera/image")
         raise HTTPException(
             status_code=500,
             detail=str(e),
-        )
+        ) from e
 
 
 # ── Endpoints Batch e Métricas ──────────────────────────────
@@ -549,18 +558,21 @@ async def stream_camera(
             "-o", "-",
         ]
 
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        loop = asyncio.get_event_loop()
+
+        proc = await loop.run_in_executor(
+            None,
+            lambda: subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ),
         )
 
         print(
             f"[stream/camera] rpicam-vid iniciado (pid={proc.pid})",
             flush=True,
         )
-
-        loop = asyncio.get_event_loop()
 
         async with _streaming_lock:
             try:
