@@ -2,11 +2,13 @@ import base64
 import io
 import subprocess
 import time
+import asyncio
 
 import cv2
 import httpx
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import HTMLResponse, StreamingResponse
 from PIL import Image
 
 from model import load_model, get_default_model_name
@@ -20,6 +22,8 @@ from schemas import (
     Detection,
 )
 
+import asyncio
+
 app = FastAPI(
     title="YOLO Inference API",
     description="API REST para inferência com YOLOv8 e Câmera no Raspberry Pi 5",
@@ -31,6 +35,7 @@ _metrics = {
     "success": 0,
     "total_ms": 0.0,
 }
+_streaming_lock = asyncio.Lock()
 
 
 def _decode_image(image_base64: str) -> np.ndarray:
@@ -495,3 +500,187 @@ async def get_metrics():
         successful_requests=_metrics["success"],
         avg_inference_ms=round(avg, 2),
     )
+
+# ── Streaming de Vídeo (MJPEG) ──────────────────────────────
+
+@app.get("/stream/camera")
+async def stream_camera(
+    request: Request,
+    confidence: float = Query(
+        0.25,
+        ge=0.0,
+        le=1.0,
+        description="Limiar de confiança",
+    ),
+    model_name: str = Query(
+        "yolov8n.pt",
+        description="Modelo YOLO a ser utilizado",
+    ),
+    framerate: int = Query(
+        15,
+        ge=1,
+        le=30,
+        description="FPS de captura solicitados ao sensor",
+    ),
+):
+    """
+    Transmite vídeo contínuo da câmera com detecções YOLO
+    sobrepostas em cada frame.
+    """
+    if _streaming_lock.locked():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Já existe um stream de câmera em andamento. "
+                "Feche a aba atual antes de abrir outra."
+            ),
+        )
+
+    model = load_model(model_name)
+
+    async def frame_generator():
+        cmd = [
+            "rpicam-vid",
+            "-t", "0",
+            "-n",
+            "--codec", "mjpeg",
+            "--quality", "80",
+            "--width", "640",
+            "--height", "480",
+            "--framerate", str(framerate),
+            "-o", "-",
+        ]
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        print(
+            f"[stream/camera] rpicam-vid iniciado (pid={proc.pid})",
+            flush=True,
+        )
+
+        loop = asyncio.get_event_loop()
+
+        async with _streaming_lock:
+            try:
+                buffer = b""
+
+                while True:
+                    if await request.is_disconnected():
+                        break
+
+                    try:
+                        chunk = await asyncio.wait_for(
+                            loop.run_in_executor(
+                                None,
+                                proc.stdout.read,
+                                4096,
+                            ),
+                            timeout=5.0,
+                        )
+                    except asyncio.TimeoutError:
+                        print(
+                            "[stream/camera] Nenhum frame em 5s — encerrando "
+                            "(câmera pode estar ocupada ou não detectada).",
+                            flush=True,
+                        )
+                        break
+
+                    if not chunk:
+                        break
+
+                    buffer += chunk
+
+                    # Extrai todos os frames JPEG completos disponíveis.
+                    while True:
+                        start_idx = buffer.find(b"\xff\xd8")
+                        end_idx = (
+                            buffer.find(b"\xff\xd9", start_idx + 2)
+                            if start_idx != -1
+                            else -1
+                        )
+
+                        if start_idx == -1 or end_idx == -1:
+                            break
+
+                        raw_frame = buffer[start_idx:end_idx + 2]
+                        buffer = buffer[end_idx + 2:]
+
+                        img = Image.open(
+                            io.BytesIO(raw_frame)
+                        ).convert("RGB")
+
+                        img_np = np.array(img)
+
+                        results = model(
+                            img_np,
+                            conf=confidence,
+                            verbose=False,
+                        )
+
+                        annotated = results[0].plot()
+                        annotated_pil = Image.fromarray(annotated)
+
+                        out_buffer = io.BytesIO()
+
+                        annotated_pil.save(
+                            out_buffer,
+                            format="JPEG",
+                            quality=85,
+                        )
+
+                        jpeg_bytes = out_buffer.getvalue()
+
+                        yield (
+                            b"--frame\r\n"
+                            b"Content-Type: image/jpeg\r\n\r\n"
+                            + jpeg_bytes
+                            + b"\r\n"
+                        )
+
+            finally:
+                proc.terminate()
+
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+
+                if proc.stderr:
+                    stderr_output = (
+                        proc.stderr.read()
+                        .decode(errors="ignore")
+                        .strip()
+                    )
+
+                    if stderr_output:
+                        print(
+                            f"[stream/camera] rpicam-vid stderr:\n"
+                            f"{stderr_output}",
+                            flush=True,
+                        )
+
+    return StreamingResponse(
+        frame_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.get("/stream/view", response_class=HTMLResponse)
+async def stream_view():
+    """Página simples para visualizar o stream anotado no navegador."""
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>YOLO Live Stream — Raspberry Pi 5</title>
+</head>
+<body style="margin:0; background:#111; display:flex; justify-content:center; align-items:center; height:100vh;">
+    <img src="/stream/camera" style="max-width:100%; height:auto;" />
+</body>
+</html>
+"""
